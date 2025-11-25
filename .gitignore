@@ -1,0 +1,10 @@
+# build artifacts
+build/
+*.exe
+*.o
+*.out
+*.log
+*.csv
+*.bak
+*~ 
+
