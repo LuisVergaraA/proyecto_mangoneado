@@ -1,6 +1,11 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 
+#ifndef _WIN32
+  #define _POSIX_C_SOURCE 200809L
+  #include <unistd.h>
+#endif
+
 #ifdef _WIN32
   #define _CRT_SECURE_NO_WARNINGS
   #include <winsock2.h>

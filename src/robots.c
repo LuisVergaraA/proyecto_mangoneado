@@ -1,7 +1,8 @@
-// robots.c (VERSIÓN CORREGIDA)
-// Recibe lista de mangos y corre la simulación con R robots (pthread).
-// CORRECCIÓN CRÍTICA: Cada robot solo etiqueta mangos en SU ZONA asignada
-// Uso: ./robots <port> <R> <X(cm/s)> <Z(cm)> <W(cm)> <label_time_ms> <B_prob>
+// robots.c (VERSIÓN MEJORADA)
+// Mejoras implementadas:
+// 1. Activación dinámica de robots según carga (Requisito 6)
+// 2. Reasignación de zonas cuando robots fallan
+// 3. Mejor manejo de redundancia
 
 #include "platform.h"
 #include "common.h"
@@ -19,12 +20,15 @@
 
 typedef struct {
     int id;
-    double pos;           // posición del robot en la banda (cm)
-    double zone_start;    // inicio de zona de trabajo (cm)
-    double zone_end;      // fin de zona de trabajo (cm)
-    int active;           // 1=operativo, 0=fallado
-    int mangos_tagged;    // contador de mangos etiquetados
-    double total_work_time; // tiempo acumulado etiquetando
+    double pos;
+    double zone_start;
+    double zone_end;
+    int active;              // 1=operativo, 0=inactivo
+    int should_work;         // 1=debe trabajar según carga, 0=standby
+    int failed;              // 1=fallado temporalmente
+    int mangos_tagged;
+    double total_work_time;
+    double idle_time;        // NUEVO: tiempo inactivo
 } Robot;
 
 typedef struct {
@@ -33,6 +37,8 @@ typedef struct {
     int missed_mangos;
     double simulation_time;
     int robot_failures;
+    int robots_active;       // NUEVO: robots actualmente activos
+    int robots_needed;       // NUEVO: robots necesarios según carga
 } Metrics;
 
 static Mango *mangos = NULL;
@@ -40,6 +46,7 @@ static int mango_count = 0;
 static pthread_mutex_t *mango_locks = NULL;
 static pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t metrics_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t robot_state_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static Robot *robots = NULL;
 static int R = 0;
@@ -50,13 +57,12 @@ static int label_time_ms = 100;
 static double B_fail = 0.0;
 
 static double sim_time = 0.0;
-static double dt = 0.05; // seconds
+static double dt = 0.05;
 static double box_pos = -1000.0;
 static int simulation_running = 1;
 
 static Metrics metrics = {0};
 
-// Signal handler para limpieza
 void cleanup_handler(int sig) {
     printf("\n\n[CLEANUP] Señal recibida (%d), limpiando recursos...\n", sig);
     simulation_running = 0;
@@ -69,6 +75,7 @@ void cleanup_handler(int sig) {
     }
     pthread_mutex_destroy(&print_lock);
     pthread_mutex_destroy(&metrics_lock);
+    pthread_mutex_destroy(&robot_state_lock);
     
     free(mangos);
     free(robots);
@@ -90,13 +97,64 @@ static int all_tagged() {
     return 1;
 }
 
-// CORRECCIÓN CRÍTICA: Validar si mango está en la zona del robot
-int is_mango_in_zone(Robot *r, int mango_idx, double current_box_pos) {
-    double mango_abs_x = current_box_pos + mangos[mango_idx].x;
+// NUEVO: Calcular cuántos robots son necesarios según carga actual
+int calculate_needed_robots(int N, double X, double Z, double W, int label_ms) {
+    // Capacidad teórica: tiempo que la caja está en zona del robot
+    double time_in_zone = (W / (R - 1)) / X;  // segundos
+    double labels_per_robot = time_in_zone / (label_ms / 1000.0);
     
-    // Especificación: "puede colocar una etiqueta una vez que la caja está 
-    // justo en frente del eje de rotación del brazo y hasta que la caja 
-    // llegue al eje de rotación del siguiente robot"
+    int needed = (int)ceil((double)N / labels_per_robot);
+    
+    // Agregar margen de seguridad del 20%
+    needed = (int)ceil(needed * 1.2);
+    
+    if(needed < 1) needed = 1;
+    if(needed > R) needed = R;
+    
+    return needed;
+}
+
+// NUEVO: Redistribuir zonas dinámicamente considerando robots activos
+void redistribute_zones() {
+    pthread_mutex_lock(&robot_state_lock);
+    
+    // Contar robots que deben trabajar y están operativos
+    int active_count = 0;
+    for(int i = 0; i < R; i++) {
+        if(robots[i].should_work && !robots[i].failed) {
+            active_count++;
+        }
+    }
+    
+    if(active_count == 0) {
+        pthread_mutex_unlock(&robot_state_lock);
+        return;
+    }
+    
+    // Redistribuir zonas solo entre robots activos
+    double zone_width = W_len / active_count;
+    int zone_idx = 0;
+    
+    for(int i = 0; i < R; i++) {
+        if(robots[i].should_work && !robots[i].failed) {
+            robots[i].zone_start = -W_len / 2.0 + zone_idx * zone_width;
+            robots[i].zone_end = robots[i].zone_start + zone_width;
+            zone_idx++;
+        } else {
+            robots[i].zone_start = 0;
+            robots[i].zone_end = 0;
+        }
+    }
+    
+    metrics.robots_active = active_count;
+    
+    pthread_mutex_unlock(&robot_state_lock);
+}
+
+int is_mango_in_zone(Robot *r, int mango_idx, double current_box_pos) {
+    if(!r->should_work || r->failed) return 0;
+    
+    double mango_abs_x = current_box_pos + mangos[mango_idx].x;
     return (mango_abs_x >= r->zone_start && mango_abs_x < r->zone_end);
 }
 
@@ -105,16 +163,29 @@ void *robot_thread(void *arg) {
     unsigned int seed = (unsigned int)(time(NULL) ^ (r->id * 0x9e3779b9));
     
     pthread_mutex_lock(&print_lock);
-    printf("[Robot %d] Iniciado - Zona: [%.2f, %.2f) cm\n", 
-           r->id, r->zone_start, r->zone_end);
+    printf("[Robot %d] Thread iniciado\n", r->id);
     pthread_mutex_unlock(&print_lock);
     
+    double last_activity_time = 0.0;
+    
     while(simulation_running && !all_tagged()) {
+        // NUEVO: Si no debe trabajar, quedarse en standby
+        if(!r->should_work) {
+            r->active = 0;
+            r->idle_time += dt;
+            sleep_ms((int)(dt * 1000));
+            continue;
+        }
+        
+        // Si llegó aquí, debe trabajar
+        r->active = 1;
+        
         // Simular fallas aleatorias con probabilidad B
-        if(r->active && B_fail > 0) {
+        if(!r->failed && B_fail > 0) {
             double p = (double)rand_r(&seed) / RAND_MAX;
-            if(p < B_fail * dt) {  // Probabilidad por unidad de tiempo
-                r->active = 0;
+            if(p < B_fail * dt) {
+                r->failed = 1;
+                
                 pthread_mutex_lock(&print_lock);
                 printf("[Robot %d] ⚠ FALLA detectada (t=%.2fs)\n", r->id, sim_time);
                 pthread_mutex_unlock(&print_lock);
@@ -123,31 +194,37 @@ void *robot_thread(void *arg) {
                 metrics.robot_failures++;
                 pthread_mutex_unlock(&metrics_lock);
                 
+                // NUEVO: Redistribuir zonas cuando falla un robot
+                redistribute_zones();
+                
                 // Tiempo de recuperación aleatorio
                 int downtime = 100 + (rand_r(&seed) % 900);
                 sleep_ms(downtime);
                 
-                r->active = 1;
+                r->failed = 0;
+                
                 pthread_mutex_lock(&print_lock);
                 printf("[Robot %d] ✓ Recuperado (downtime=%dms)\n", r->id, downtime);
                 pthread_mutex_unlock(&print_lock);
+                
+                // Redistribuir nuevamente al recuperarse
+                redistribute_zones();
             }
         }
         
-        if(!r->active) {
+        if(r->failed) {
             sleep_ms((int)(dt * 1000));
             continue;
         }
         
         // Buscar mangos en la zona asignada
+        int worked_this_cycle = 0;
+        
         for(int i = 0; i < mango_count; i++) {
             if(mangos[i].claimed) continue;
             
-            // CORRECCIÓN: Verificar zona asignada
             if(is_mango_in_zone(r, i, box_pos)) {
-                // Intentar adquirir lock del mango
                 if(pthread_mutex_trylock(&mango_locks[i]) == 0) {
-                    // Double-check después de adquirir lock
                     if(!mangos[i].claimed && 
                        is_mango_in_zone(r, i, box_pos)) {
                         
@@ -155,25 +232,18 @@ void *robot_thread(void *arg) {
                         
                         pthread_mutex_lock(&print_lock);
                         printf("[Robot %d] 🏷️  Etiquetando mango %d "
-                               "(pos_rel=%.2f, box_pos=%.2f, t=%.2fs)\n",
+                               "(x=%.2f, box=%.2f, t=%.2fs)\n",
                                r->id, i, mangos[i].x, box_pos, sim_time);
                         pthread_mutex_unlock(&print_lock);
                         
                         pthread_mutex_unlock(&mango_locks[i]);
                         
-                        // Simular tiempo de etiquetado
                         sleep_ms(label_time_ms);
                         
                         r->mangos_tagged++;
                         r->total_work_time += label_time_ms / 1000.0;
-                        
-                        // Validar si el mango se movió fuera de alcance
-                        if(!is_mango_in_zone(r, i, box_pos)) {
-                            pthread_mutex_lock(&print_lock);
-                            printf("[Robot %d] ⚠ Mango %d salió de zona durante etiquetado\n",
-                                   r->id, i);
-                            pthread_mutex_unlock(&print_lock);
-                        }
+                        worked_this_cycle = 1;
+                        last_activity_time = sim_time;
                     } else {
                         pthread_mutex_unlock(&mango_locks[i]);
                     }
@@ -181,12 +251,20 @@ void *robot_thread(void *arg) {
             }
         }
         
+        if(!worked_this_cycle) {
+            r->idle_time += dt;
+        }
+        
         sleep_ms((int)(dt * 1000));
     }
     
     pthread_mutex_lock(&print_lock);
-    printf("[Robot %d] Finalizando - Etiquetó %d mangos (%.2fs trabajo)\n",
-           r->id, r->mangos_tagged, r->total_work_time);
+    double utilization = 0.0;
+    if(sim_time > 0) {
+        utilization = (r->total_work_time / sim_time) * 100.0;
+    }
+    printf("[Robot %d] Finalizando - %d mangos, %.1f%% utilización, %.1fs idle\n",
+           r->id, r->mangos_tagged, utilization, r->idle_time);
     pthread_mutex_unlock(&print_lock);
     
     return NULL;
@@ -200,7 +278,6 @@ int accept_and_read(int port) {
         return -1;
     }
     
-    // Permitir reuso de puerto
     int opt = 1;
 #ifdef _WIN32
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
@@ -244,7 +321,6 @@ int accept_and_read(int port) {
     
     printf("Conexión aceptada desde vision.\n");
     
-    // Leer datos
     char buf[RECV_BUF + 1];
     int offset = 0;
     int header_read = 0;
@@ -335,17 +411,22 @@ void print_final_statistics() {
     printf("  Mangos perdidos:     %d\n", metrics.missed_mangos);
     printf("  Tiempo simulación:   %.2f s\n", metrics.simulation_time);
     printf("  Fallas de robots:    %d\n", metrics.robot_failures);
+    printf("  Robots necesarios:   %d de %d disponibles\n", 
+           metrics.robots_needed, R);
+    printf("  Robots activos prom: %d\n", metrics.robots_active);
     printf("\n  Rendimiento por robot:\n");
+    
     for(int i = 0; i < R; i++) {
         double utilization = robots[i].total_work_time / metrics.simulation_time * 100.0;
-        printf("    Robot %d: %d mangos, %.1f%% utilización\n",
-               i, robots[i].mangos_tagged, utilization);
+        const char *status = robots[i].should_work ? "ACTIVO" : "STANDBY";
+        
+        printf("    Robot %d [%s]: %d mangos, %.1f%% utilización, %.1fs idle\n",
+               i, status, robots[i].mangos_tagged, utilization, robots[i].idle_time);
     }
     printf("\n");
 }
 
 int main(int argc, char **argv) {
-    // Registrar signal handlers
     signal(SIGINT, cleanup_handler);
     signal(SIGTERM, cleanup_handler);
     
@@ -364,7 +445,6 @@ int main(int argc, char **argv) {
     label_time_ms = atoi(argv[6]);
     B_fail = atof(argv[7]);
     
-    // Validación de entrada
     if(port < 1024 || port > 65535) {
         fprintf(stderr, "Error: Puerto debe estar entre 1024-65535\n");
         return 1;
@@ -388,6 +468,7 @@ int main(int argc, char **argv) {
     
     printf("\n╔══════════════════════════════════════════════════════╗\n");
     printf("║        MangoNeado - Sistema de Etiquetado           ║\n");
+    printf("║              (Versión Mejorada v2.0)                 ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n");
     printf("Parámetros:\n");
     printf("  Puerto:          %d\n", port);
@@ -398,7 +479,6 @@ int main(int argc, char **argv) {
     printf("  Tiempo etiqueta: %d ms\n", label_time_ms);
     printf("  Prob. falla (B): %.3f\n\n", B_fail);
     
-    // Recibir datos de vision
     if(accept_and_read(port) != 0) {
         fprintf(stderr, "Error recibiendo datos de vision\n");
         return 1;
@@ -411,37 +491,51 @@ int main(int argc, char **argv) {
     
     metrics.total_mangos = mango_count;
     
-    printf("✓ Recibidos %d mangos. Iniciando simulación...\n\n", mango_count);
+    // NUEVO: Calcular cuántos robots son realmente necesarios
+    int needed = calculate_needed_robots(mango_count, X_speed, Z_side, W_len, label_time_ms);
+    metrics.robots_needed = needed;
     
-    // Inicializar robots con zonas asignadas
+    printf("✓ Recibidos %d mangos\n", mango_count);
+    printf("✓ Análisis de carga: se necesitan %d robots de %d disponibles\n\n", 
+           needed, R);
+    
+    // Inicializar robots
     robots = (Robot*)calloc(R, sizeof(Robot));
     pthread_t *threads = (pthread_t*)malloc(sizeof(pthread_t) * R);
     
     for(int i = 0; i < R; i++) {
         robots[i].id = i;
-        robots[i].active = 1;
+        robots[i].active = 0;
+        robots[i].failed = 0;
         robots[i].mangos_tagged = 0;
         robots[i].total_work_time = 0.0;
+        robots[i].idle_time = 0.0;
         
-        // Distribución homogénea según especificación
+        // NUEVO: Solo activar los robots necesarios
+        if(i < needed) {
+            robots[i].should_work = 1;
+            printf("Robot %d: ACTIVO (en operación)\n", i);
+        } else {
+            robots[i].should_work = 0;
+            printf("Robot %d: STANDBY (reserva para redundancia)\n", i);
+        }
+        
+        // Distribución inicial (se redistribuirá dinámicamente)
         if(R == 1) {
             robots[i].pos = 0.0;
             robots[i].zone_start = -W_len / 2.0;
             robots[i].zone_end = W_len / 2.0;
         } else {
             robots[i].pos = -W_len / 2.0 + ((double)i) * (W_len / (R - 1));
-            robots[i].zone_start = robots[i].pos;
-            
-            if(i < R - 1) {
-                robots[i].zone_end = -W_len / 2.0 + 
-                                     ((double)(i + 1)) * (W_len / (R - 1));
-            } else {
-                robots[i].zone_end = W_len / 2.0;
-            }
         }
     }
     
-    // Crear threads de robots
+    // Redistribuir zonas considerando solo robots activos
+    redistribute_zones();
+    
+    printf("\n");
+    
+    // Crear threads
     for(int i = 0; i < R; i++) {
         if(pthread_create(&threads[i], NULL, robot_thread, &robots[i]) != 0) {
             perror("pthread_create");
@@ -449,21 +543,20 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Loop principal de simulación
+    // Loop principal
     sim_time = 0.0;
-    box_pos = -W_len - Z_side; // Empezar antes de la zona de robots
+    box_pos = -W_len - Z_side;
     double time_limit = 120.0;
     
     while(sim_time < time_limit && !all_tagged() && simulation_running) {
         sim_time += dt;
         box_pos += X_speed * dt;
         
-        // Imprimir estado cada 5 segundos
         if(((int)(sim_time * 10)) % 50 == 0) {
             int tagged = count_tagged();
-            printf("[Sim t=%.1fs] Box pos=%.1f cm | Etiquetados: %d/%d (%.1f%%)\n",
+            printf("[Sim t=%.1fs] Box=%.1fcm | Etiquetados: %d/%d (%.1f%%) | Activos: %d/%d\n",
                    sim_time, box_pos, tagged, mango_count,
-                   100.0 * tagged / mango_count);
+                   100.0 * tagged / mango_count, metrics.robots_active, R);
         }
         
         sleep_ms((int)(dt * 1000));
@@ -471,12 +564,10 @@ int main(int argc, char **argv) {
     
     simulation_running = 0;
     
-    // Esperar threads
     for(int i = 0; i < R; i++) {
         pthread_join(threads[i], NULL);
     }
     
-    // Recolectar métricas finales
     metrics.tagged_mangos = count_tagged();
     metrics.missed_mangos = mango_count - metrics.tagged_mangos;
     metrics.simulation_time = sim_time;
@@ -489,6 +580,7 @@ int main(int argc, char **argv) {
     }
     pthread_mutex_destroy(&print_lock);
     pthread_mutex_destroy(&metrics_lock);
+    pthread_mutex_destroy(&robot_state_lock);
     
     free(mango_locks);
     free(mangos);
