@@ -1,4 +1,4 @@
-// robots.c (VERSIÓN MEJORADA)
+// robots.c
 // Mejoras implementadas:
 // 1. Activación dinámica de robots según carga (Requisito 6)
 // 2. Reasignación de zonas cuando robots fallan
@@ -28,7 +28,7 @@ typedef struct {
     int failed;              // 1=fallado temporalmente
     int mangos_tagged;
     double total_work_time;
-    double idle_time;        // NUEVO: tiempo inactivo
+    double idle_time;        // tiempo inactivo
 } Robot;
 
 typedef struct {
@@ -37,8 +37,8 @@ typedef struct {
     int missed_mangos;
     double simulation_time;
     int robot_failures;
-    int robots_active;       // NUEVO: robots actualmente activos
-    int robots_needed;       // NUEVO: robots necesarios según carga
+    int robots_active;       // robots actualmente activos
+    int robots_needed;       // robots necesarios según carga
 } Metrics;
 
 static Mango *mangos = NULL;
@@ -97,7 +97,7 @@ static int all_tagged() {
     return 1;
 }
 
-// NUEVO: Calcular cuántos robots son necesarios según carga actual
+// Calcular cuántos robots son necesarios según carga actual
 int calculate_needed_robots(int N, double X, double Z, double W, int label_ms) {
     // Tiempo que tarda la caja en atravesar completamente la banda
     double total_time = (W + Z) / X;  // segundos
@@ -124,7 +124,7 @@ int calculate_needed_robots(int N, double X, double Z, double W, int label_ms) {
     return needed;
 }
 
-// NUEVO: Redistribuir zonas dinámicamente considerando robots activos
+// Redistribuir zonas dinámicamente considerando robots activos
 void redistribute_zones() {
     pthread_mutex_lock(&robot_state_lock);
     
@@ -141,7 +141,7 @@ void redistribute_zones() {
         return;
     }
     
-    // NUEVO: Asignar zonas en la BANDA (para saber cuándo pueden trabajar)
+    // Asignar zonas en la BANDA (para saber cuándo pueden trabajar)
     // Distribuir uniformemente los robots a lo largo de W
     double spacing = W_len / (active_count + 1);
     int zone_idx = 0;
@@ -177,7 +177,7 @@ void redistribute_zones() {
 int is_mango_in_zone(Robot *r, int mango_idx, double current_box_pos) {
     if(!r->should_work || r->failed) return 0;
     
-    // NUEVO: Zona basada en coordenada X del mango dentro de la caja
+    // Zona basada en coordenada X del mango dentro de la caja
     // Dividir el ancho Z_side entre robots activos
     
     pthread_mutex_lock(&robot_state_lock);
@@ -240,7 +240,7 @@ void *robot_thread(void *arg) {
                 r->failed = 1;
                 
                 pthread_mutex_lock(&print_lock);
-                printf("[Robot %d] ⚠ FALLA detectada (t=%.2fs)\n", r->id, sim_time);
+                printf("[Robot %d] FALLA detectada (t=%.2fs)\n", r->id, sim_time);
                 pthread_mutex_unlock(&print_lock);
                 
                 pthread_mutex_lock(&metrics_lock);
@@ -257,7 +257,7 @@ void *robot_thread(void *arg) {
                 r->failed = 0;
                 
                 pthread_mutex_lock(&print_lock);
-                printf("[Robot %d] ✓ Recuperado (downtime=%dms)\n", r->id, downtime);
+                printf("[Robot %d]  Recuperado (downtime=%dms)\n", r->id, downtime);
                 pthread_mutex_unlock(&print_lock);
                 
                 // Redistribuir nuevamente al recuperarse
@@ -284,7 +284,7 @@ void *robot_thread(void *arg) {
                         mangos[i].claimed = 1;
                         
                         pthread_mutex_lock(&print_lock);
-                        printf("[Robot %d] 🏷️  Etiquetando mango %d "
+                        printf("[Robot %d]  Etiquetando mango %d "
                                "(x=%.2f, box=%.2f, t=%.2fs)\n",
                                r->id, i, mangos[i].x, box_pos, sim_time);
                         pthread_mutex_unlock(&print_lock);
@@ -455,7 +455,7 @@ int accept_and_read(int port) {
 void print_final_statistics() {
     printf("\n");
     printf("╔══════════════════════════════════════════════════════╗\n");
-    printf("║           ESTADÍSTICAS FINALES                       ║\n");
+    printf("║                 ESTADÍSTICAS FINALES                 ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n");
     printf("  Mangos totales:      %d\n", metrics.total_mangos);
     printf("  Mangos etiquetados:  %d (%.1f%%)\n", 
@@ -543,12 +543,12 @@ int main(int argc, char **argv) {
     
     metrics.total_mangos = mango_count;
     
-    // NUEVO: Calcular cuántos robots son realmente necesarios
+    // Calcular cuántos robots son realmente necesarios
     int needed = calculate_needed_robots(mango_count, X_speed, Z_side, W_len, label_time_ms);
     metrics.robots_needed = needed;
     
     printf("✓ Recibidos %d mangos\n", mango_count);
-    // DEBUG: Imprimir posiciones de mangos
+    // Imprimir posiciones de mangos
     printf("\n[DEBUG] Posiciones de mangos en la caja:\n");
     for(int i = 0; i < mango_count && i < 20; i++) {  // Solo primeros 20
         printf("  Mango %d: x=%.2f, y=%.2f\n", i, mangos[i].x, mangos[i].y);

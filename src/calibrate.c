@@ -14,7 +14,7 @@
 #endif
 
 #define MAX_ROBOTS 20
-#define TRIALS_PER_CONFIG 2  // Reducido para acelerar
+#define TRIALS_PER_CONFIG 2  
 #define SUCCESS_THRESHOLD 0.95  // 95% de mangos etiquetados = éxito
 
 typedef struct {
@@ -110,7 +110,7 @@ void calibrate_for_B(double B, int N_min, int N_max, double X, double Z,
     fprintf(fp, "N,R_min,success_rate,avg_time_s\n");
     printf("\n=== Calibrando con B=%.3f ===\n", B);
     
-    int N_step = (N_max - N_min) / 10;  // 10 puntos (reducido)
+    int N_step = (N_max - N_min) / 10; 
     if(N_step < 1) N_step = 1;
     
     for(int N = N_min; N <= N_max; N += N_step) {
@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
     int N_max_extended = (int)(N_max * 1.2);
     
     printf("╔════════════════════════════════════════════════╗\n");
-    printf("║     MangoNeado - Sistema de Calibración       ║\n");
+    printf("║      MangoNeado - Sistema de Calibración       ║\n");
     printf("╚════════════════════════════════════════════════╝\n");
     printf("Parámetros:\n");
     printf("  N: %d → %d (1.2×%d)\n", N_min, N_max_extended, N_max);
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
     printf("  Output: %s\n\n", output_dir);
     
 #ifdef _WIN32
-    printf("⚠️  ADVERTENCIA: En Windows se usan estimaciones teóricas.\n");
+    printf("ADVERTENCIA: En Windows se usan estimaciones teóricas.\n");
     printf("   Para simulaciones reales, ejecutar en Linux/WSL.\n\n");
 #else
     printf("✓ Ejecutando simulaciones REALES (Linux/WSL)\n\n");
