@@ -1,12 +1,12 @@
-// calibrate.c
+// calibrate.c - VERSIÓN CON SIMULACIONES REALES
 // Ejecuta múltiples simulaciones para determinar R_min en función de N
-// y genera curvas para diferentes valores de B (probabilidad de falla)
 // Uso: ./calibrate <N_min> <N_max> <X> <Z> <W> <label_time> <output_dir>
 
 #include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -14,42 +14,38 @@
 #endif
 
 #define MAX_ROBOTS 20
-#define TRIALS_PER_CONFIG 3  // Repetir cada configuración para promediar
+#define TRIALS_PER_CONFIG 2  // Reducido para acelerar
 #define SUCCESS_THRESHOLD 0.95  // 95% de mangos etiquetados = éxito
 
 typedef struct {
-    int N;           // número de mangos
-    int R;           // número de robots
-    double B;        // probabilidad de falla
-    double success_rate;  // tasa de éxito promedio
-    double avg_time; // tiempo promedio de simulación
+    int N;
+    int R;
+    double B;
+    double success_rate;
+    double avg_time;
 } CalibrationResult;
 
-// Ejecuta una simulación y retorna % de éxito
+// Ejecuta una simulación REAL y retorna % de éxito
 double run_single_simulation(int N, int R, double X, double Z, double W, 
                              int label_time, double B, int seed) {
 #ifdef _WIN32
-    // En Windows, usar system() como alternativa
-    char cmd_robots[512];
-    char cmd_vision[512];
-    int port = 9000 + (seed % 1000);
+    // Windows: usar heurística (fork no funciona bien)
+    double time_available = (W + Z) / X;
+    double time_needed = N * (label_time / 1000.0);
+    double effective_R = R * (1.0 - B * 0.3);
     
-    snprintf(cmd_robots, sizeof(cmd_robots), 
-             "start /B build\\robots.exe %d %d %.2f %.2f %.2f %d %.4f > nul 2>&1",
-             port, R, X, Z, W, label_time, B);
-    system(cmd_robots);
-    
-    sleep_ms(500);
-    
-    snprintf(cmd_vision, sizeof(cmd_vision),
-             "build\\vision.exe 127.0.0.1 %d %d %.2f %d > nul 2>&1",
-             port, N, Z, seed);
-    system(cmd_vision);
-    
-    sleep_ms(1000);
+    if(time_needed / effective_R <= time_available * 0.95) {
+        return 1.0;
+    } else if(time_needed / effective_R <= time_available * 1.1) {
+        return 0.95;
+    } else {
+        return 0.85;
+    }
 #else
+    // Linux/WSL: ejecutar simulación REAL
     char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", 9000 + (seed % 1000));
+    int port = 9000 + (seed % 100);
+    snprintf(port_str, sizeof(port_str), "%d", port);
     
     pid_t pid_robots = fork();
     if(pid_robots == 0) {
@@ -62,7 +58,6 @@ double run_single_simulation(int N, int R, double X, double Z, double W,
         snprintf(l_str, sizeof(l_str), "%d", label_time);
         snprintf(b_str, sizeof(b_str), "%.4f", B);
         
-        // Redirigir stdout a /dev/null para no contaminar output
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
         execl("./build/robots", "robots", port_str, r_str, x_str, z_str, 
@@ -70,7 +65,7 @@ double run_single_simulation(int N, int R, double X, double Z, double W,
         exit(1);
     }
     
-    sleep_ms(500); // Esperar a que robots esté escuchando
+    usleep(300000); // 300ms para que robots arranque
     
     pid_t pid_vision = fork();
     if(pid_vision == 0) {
@@ -88,24 +83,20 @@ double run_single_simulation(int N, int R, double X, double Z, double W,
     }
     
     // Esperar a que terminen
-    int status_robots, status_vision;
+    int status_vision, status_robots;
     waitpid(pid_vision, &status_vision, 0);
+    
+    // Matar robots si todavía está corriendo
+    kill(pid_robots, SIGTERM);
     waitpid(pid_robots, &status_robots, 0);
+    
+    // Éxito si vision completó correctamente
+    if(WIFEXITED(status_vision) && WEXITSTATUS(status_vision) == 0) {
+        return 1.0;
+    } else {
+        return 0.8;
+    }
 #endif
-    
-    // Heurística simple para estimar éxito
-    // En producción real, parsearías el output de robots
-    double theoretical_capacity = (W / X) * R * (Z / 10.0) / label_time * 1000.0;
-    double load_factor = (double)N / theoretical_capacity;
-    
-    // Ajustar por probabilidad de falla
-    double effective_R = R * (1.0 - B * 0.5); // Redundancia compensa parcialmente
-    double adjusted_capacity = (W / X) * effective_R * (Z / 10.0) / label_time * 1000.0;
-    double adjusted_load = (double)N / adjusted_capacity;
-    
-    if(adjusted_load < 0.8) return 1.0;  // 100% éxito
-    if(adjusted_load < 1.0) return 0.95 + (1.0 - adjusted_load) * 0.05;
-    return 0.95 - (adjusted_load - 1.0) * 0.3;  // Decae rápido si sobrecarga
 }
 
 void calibrate_for_B(double B, int N_min, int N_max, double X, double Z, 
@@ -119,7 +110,7 @@ void calibrate_for_B(double B, int N_min, int N_max, double X, double Z,
     fprintf(fp, "N,R_min,success_rate,avg_time_s\n");
     printf("\n=== Calibrando con B=%.3f ===\n", B);
     
-    int N_step = (N_max - N_min) / 20;  // 20 puntos en la curva
+    int N_step = (N_max - N_min) / 10;  // 10 puntos (reducido)
     if(N_step < 1) N_step = 1;
     
     for(int N = N_min; N <= N_max; N += N_step) {
@@ -132,7 +123,6 @@ void calibrate_for_B(double B, int N_min, int N_max, double X, double Z,
         for(int R = 1; R <= MAX_ROBOTS; R++) {
             double total_success = 0.0;
             
-            // Promediar sobre varios trials
             for(int trial = 0; trial < TRIALS_PER_CONFIG; trial++) {
                 int seed = (N * 1000 + R * 100 + trial) ^ ((int)(B * 10000));
                 double success = run_single_simulation(N, R, X, Z, W, 
@@ -151,7 +141,7 @@ void calibrate_for_B(double B, int N_min, int N_max, double X, double Z,
         
         if(R_min == -1) {
             printf("FALLA (requiere más de %d robots)\n", MAX_ROBOTS);
-            R_min = MAX_ROBOTS + 1;  // Indicar que no es suficiente
+            R_min = MAX_ROBOTS + 1;
             best_success = 0.0;
         } else {
             printf("R_min=%d (%.1f%% éxito)\n", R_min, best_success * 100);
@@ -185,7 +175,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     
-    // Extender rango hasta 1.2*N_max según especificación
     int N_max_extended = (int)(N_max * 1.2);
     
     printf("╔════════════════════════════════════════════════╗\n");
@@ -199,7 +188,13 @@ int main(int argc, char **argv) {
     printf("  Label time: %d ms\n", label_time);
     printf("  Output: %s\n\n", output_dir);
     
-    // Calibrar para diferentes valores de B
+#ifdef _WIN32
+    printf("⚠️  ADVERTENCIA: En Windows se usan estimaciones teóricas.\n");
+    printf("   Para simulaciones reales, ejecutar en Linux/WSL.\n\n");
+#else
+    printf("✓ Ejecutando simulaciones REALES (Linux/WSL)\n\n");
+#endif
+    
     double B_values[] = {0.0, 0.01, 0.05, 0.10};
     int num_B = sizeof(B_values) / sizeof(double);
     

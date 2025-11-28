@@ -99,15 +99,25 @@ static int all_tagged() {
 
 // NUEVO: Calcular cuántos robots son necesarios según carga actual
 int calculate_needed_robots(int N, double X, double Z, double W, int label_ms) {
-    // Capacidad teórica: tiempo que la caja está en zona del robot
-    double time_in_zone = (W / (R - 1)) / X;  // segundos
-    double labels_per_robot = time_in_zone / (label_ms / 1000.0);
+    // Tiempo que tarda la caja en atravesar completamente la banda
+    double total_time = (W + Z) / X;  // segundos
     
-    int needed = (int)ceil((double)N / labels_per_robot);
+    // Tiempo total disponible para etiquetar todos los mangos
+    double available_time = total_time;
     
-    // Agregar margen de seguridad del 20%
-    needed = (int)ceil(needed * 1.2);
+    // Tiempo que toma etiquetar UN mango
+    double time_per_label = label_ms / 1000.0;  // segundos
     
+    // Tiempo total necesario para etiquetar N mangos
+    double total_label_time = N * time_per_label;
+    
+    // Robots necesarios = tiempo_total / tiempo_disponible
+    int needed = (int)ceil(total_label_time / available_time);
+    
+    // Agregar margen de seguridad del 15%
+    needed = (int)ceil(needed * 1.15);
+    
+    // Límites
     if(needed < 1) needed = 1;
     if(needed > R) needed = R;
     
@@ -131,14 +141,27 @@ void redistribute_zones() {
         return;
     }
     
-    // Redistribuir zonas solo entre robots activos
-    double zone_width = W_len / active_count;
+    // NUEVO: Asignar zonas en la BANDA (para saber cuándo pueden trabajar)
+    // Distribuir uniformemente los robots a lo largo de W
+    double spacing = W_len / (active_count + 1);
     int zone_idx = 0;
     
     for(int i = 0; i < R; i++) {
         if(robots[i].should_work && !robots[i].failed) {
-            robots[i].zone_start = -W_len / 2.0 + zone_idx * zone_width;
-            robots[i].zone_end = robots[i].zone_start + zone_width;
+            // Posición del robot en la banda
+            robots[i].pos = -W_len / 2.0 + (zone_idx + 1) * spacing;
+            
+            // Zona temporal donde puede trabajar (cuando caja está cerca)
+            robots[i].zone_start = robots[i].pos - spacing/2;
+            robots[i].zone_end = robots[i].pos + spacing/2;
+            
+            printf("[DEBUG] Robot %d: pos=%.2f, zona_banda=[%.2f, %.2f], "
+                   "zona_mangos=[%.2f, %.2f]\n",
+                   i, robots[i].pos,
+                   robots[i].zone_start, robots[i].zone_end,
+                   -Z_side/2 + zone_idx * (Z_side/active_count),
+                   -Z_side/2 + (zone_idx+1) * (Z_side/active_count));
+            
             zone_idx++;
         } else {
             robots[i].zone_start = 0;
@@ -154,8 +177,38 @@ void redistribute_zones() {
 int is_mango_in_zone(Robot *r, int mango_idx, double current_box_pos) {
     if(!r->should_work || r->failed) return 0;
     
-    double mango_abs_x = current_box_pos + mangos[mango_idx].x;
-    return (mango_abs_x >= r->zone_start && mango_abs_x < r->zone_end);
+    // NUEVO: Zona basada en coordenada X del mango dentro de la caja
+    // Dividir el ancho Z_side entre robots activos
+    
+    pthread_mutex_lock(&robot_state_lock);
+    int active_count = 0;
+    int my_zone_idx = -1;
+    
+    for(int i = 0; i < R; i++) {
+        if(robots[i].should_work && !robots[i].failed) {
+            if(robots[i].id == r->id) {
+                my_zone_idx = active_count;
+            }
+            active_count++;
+        }
+    }
+    pthread_mutex_unlock(&robot_state_lock);
+    
+    if(my_zone_idx < 0 || active_count == 0) return 0;
+    
+    // Dividir rango [-Z_side/2, +Z_side/2] entre robots activos
+    double zone_width = Z_side / active_count;
+    double my_zone_start = -Z_side / 2.0 + my_zone_idx * zone_width;
+    double my_zone_end = my_zone_start + zone_width;
+    
+    double mango_x = mangos[mango_idx].x;
+    
+    // Verificar si el mango está en mi zona Y la caja está cerca de mi posición en la banda
+    int in_my_x_zone = (mango_x >= my_zone_start && mango_x < my_zone_end);
+    int box_near_me = (current_box_pos >= r->zone_start - Z_side/2 && 
+                       current_box_pos <= r->zone_end + Z_side/2);
+    
+    return in_my_x_zone && box_near_me;
 }
 
 void *robot_thread(void *arg) {
@@ -468,7 +521,6 @@ int main(int argc, char **argv) {
     
     printf("\n╔══════════════════════════════════════════════════════╗\n");
     printf("║        MangoNeado - Sistema de Etiquetado           ║\n");
-    printf("║              (Versión Mejorada v2.0)                 ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n");
     printf("Parámetros:\n");
     printf("  Puerto:          %d\n", port);
@@ -496,6 +548,13 @@ int main(int argc, char **argv) {
     metrics.robots_needed = needed;
     
     printf("✓ Recibidos %d mangos\n", mango_count);
+    // DEBUG: Imprimir posiciones de mangos
+    printf("\n[DEBUG] Posiciones de mangos en la caja:\n");
+    for(int i = 0; i < mango_count && i < 20; i++) {  // Solo primeros 20
+        printf("  Mango %d: x=%.2f, y=%.2f\n", i, mangos[i].x, mangos[i].y);
+    }
+    if(mango_count > 20) printf("  ... y %d más\n", mango_count - 20);
+    printf("\n");
     printf("✓ Análisis de carga: se necesitan %d robots de %d disponibles\n\n", 
            needed, R);
     
